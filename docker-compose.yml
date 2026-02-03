@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  mongodb:
+    image: mongo:6
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  orchestrator:
+    build: ./orchestrator
+    depends_on:
+      - redis
+      - mongodb
+    volumes:
+      - ./videos:/data/videos
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongodb:27017
+    command: python orchestrator.py
+
+volumes:
+  mongo_data:
