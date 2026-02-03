@@ -24,6 +24,19 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - MONGO_URL=mongodb://mongodb:27017
     command: python orchestrator.py
+    
+  worker_480p:
+    build: ./worker_480p
+    depends_on:
+      - redis
+      - mongodb
+    volumes:
+      - ./videos:/data/videos
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongodb:27017
+    command: celery -A celery_app worker -Q transcode_480p --loglevel=info
+    restart: unless-stopped
 
 volumes:
   mongo_data:
