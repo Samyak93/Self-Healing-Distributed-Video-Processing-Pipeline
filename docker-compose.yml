@@ -20,6 +20,7 @@ services:
       - mongodb
     volumes:
       - ./videos:/data/videos
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - REDIS_URL=redis://redis:6379/0
       - MONGO_URL=mongodb://mongodb:27017

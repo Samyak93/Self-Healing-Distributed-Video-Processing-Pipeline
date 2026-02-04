@@ -1,12 +1,34 @@
 import os
 import subprocess
+import threading
+import time
 from datetime import datetime
 from pymongo import MongoClient
 from celery_app import celery_app
 
-MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
-
+MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongodb:27017")
 OUTPUT_DIR = "/data/videos/outputs/1080p"
+
+
+def heartbeat_loop(worker_id: str):
+    client = MongoClient(MONGO_URL)
+    db = client["video_pipeline"]
+    workers = db["workers"]
+
+    while True:
+        workers.update_one(
+            {"worker_id": worker_id},
+            {
+                "$set": {
+                    "worker_id": worker_id,
+                    "resolution": "1080p",
+                    "last_heartbeat": datetime.utcnow(),
+                    "status": "ALIVE",
+                }
+            },
+            upsert=True,
+        )
+        time.sleep(5)
 
 
 @celery_app.task(name="tasks.transcode_1080p", bind=True)
@@ -16,6 +38,16 @@ def transcode_1080p(self, video_id, chunk_id, chunk_path):
     chunks = db["chunks"]
 
     worker_id = self.request.hostname
+
+    # start heartbeat once per worker
+    if not hasattr(self, "_heartbeat_started"):
+        threading.Thread(
+            target=heartbeat_loop,
+            args=(worker_id,),
+            daemon=True,
+        ).start()
+        self._heartbeat_started = True
+
     start_ts = datetime.utcnow()
 
     doc = chunks.find_one_and_update(
@@ -33,7 +65,6 @@ def transcode_1080p(self, video_id, chunk_id, chunk_path):
             },
             "$inc": {"attempt": 1},
         },
-        return_document=True,
     )
 
     if doc is None:
