@@ -56,15 +56,21 @@ def transcode_1080p(self, video_id, chunk_id, chunk_path):
             "chunk_id": chunk_id,
             "resolution": "1080p",
             "status": "PENDING",
+            # do not allow same worker to re-claim the chunk
+            "$or": [
+                {"worker_id": {"$ne": self.request.hostname}},
+                {"worker_id": None},
+            ],
         },
         {
             "$set": {
                 "status": "RUNNING",
-                "worker_id": worker_id,
+                "worker_id": self.request.hostname,
                 "start_time": start_ts,
             },
             "$inc": {"attempt": 1},
         },
+        return_document=True,
     )
 
     if doc is None:
@@ -97,6 +103,7 @@ def transcode_1080p(self, video_id, chunk_id, chunk_path):
                 "video_id": video_id,
                 "chunk_id": chunk_id,
                 "resolution": "1080p",
+                "status": "RUNNING",
             },
             {
                 "$set": {

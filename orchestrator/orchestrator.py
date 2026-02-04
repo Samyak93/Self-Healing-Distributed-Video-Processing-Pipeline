@@ -17,7 +17,11 @@ CHUNK_DURATION = 10  # seconds
 HEARTBEAT_TIMEOUT = 30  # seconds
 MONITOR_INTERVAL = 10  # seconds
 
-# Map resolution → container name (EXACT names from docker ps)
+# Straggler parameters
+BASELINE_SAMPLE_SIZE = 100
+STRAGGLER_THRESHOLD = 0.75  # 75%
+
+# Map resolution -> container name
 WORKER_CONTAINERS = {
     "480p": "distributedvideoprocessingpipeline-worker_480p-1",
     "720p": "distributedvideoprocessingpipeline-worker_720p-1",
@@ -113,6 +117,81 @@ def recover_dead_workers():
 
         # Restart worker container
         restart_worker(resolution)
+        
+# ---------- STRAGGLER MITIGATION ----------
+
+def compute_latency_baselines(db):
+    baselines = {}
+
+    for res in RESOLUTIONS:
+        docs = list(
+            db.chunks.find(
+                {
+                    "resolution": res,
+                    "status": "COMPLETED",
+                    "duration_ms": {"$ne": None},
+                }
+            )
+            .sort("end_time", -1)
+            .limit(BASELINE_SAMPLE_SIZE)
+        )
+
+        if docs:
+            baselines[res] = sum(d["duration_ms"] for d in docs) / len(docs)
+    
+    return baselines
+
+
+def detect_and_mitigate_stragglers(db, baselines):
+    now = datetime.utcnow()
+
+    running_chunks = db.chunks.find({
+        "status": "RUNNING",
+        "attempt": 1,
+        "speculative": {"$ne": True},
+    })
+
+    for chunk in running_chunks:
+        baseline = baselines.get(chunk["resolution"])
+        if not baseline or not chunk.get("start_time"):
+            continue
+
+        elapsed_ms = (now - chunk["start_time"]).total_seconds() * 1000
+
+        if elapsed_ms > STRAGGLER_THRESHOLD * baseline:
+            print(
+                f"[STRAGGLER] Chunk {chunk['chunk_id']} "
+                f"({chunk['resolution']}) "
+                f"elapsed={int(elapsed_ms)}ms baseline={int(baseline)}ms"
+            )
+
+            updated = db.chunks.update_one(
+                {
+                    "_id": chunk["_id"],
+                    "status": "RUNNING",
+                    "speculative": {"$ne": True},
+                },
+                {
+                    "$set": {
+                        "status": "PENDING",
+                        "speculative": True,
+                    }
+                },
+            )
+
+            if updated.modified_count == 0:
+                continue
+
+            celery_app.send_task(
+                f"tasks.transcode_{chunk['resolution']}",
+                args=[
+                    chunk["video_id"],
+                    chunk["chunk_id"],
+                    f"{VIDEO_CHUNK_DIR}/{chunk['video_id']}/chunk_{chunk['chunk_id']:03d}.mp4",
+                ],
+            )
+
+            print(f"[SPECULATE] Relaunched chunk {chunk['chunk_id']} ({chunk['resolution']})")
 
 
 def main():
@@ -159,6 +238,7 @@ def main():
                     "end_time": None,
                     "duration_ms": None,
                     "attempt": 0,
+                    "speculative": False,
                     "output_path": None,
                     "created_at": datetime.utcnow(),
                 }
@@ -173,9 +253,22 @@ def main():
                 print(f"[ORCH] Queued chunk {idx} for {res}")
 
     print("[ORCH] Starting heartbeat monitor loop")
+    
+    latency_baselines = {}
+    # JUST FOR TESTING IF IT ACTUALLY TRIGGERS RE-EXECUTION
+    # latency_baselines = {'480p':100}
+    last_baseline_refresh = datetime.utcnow()
 
+    print("[ORCH] Starting straggler mitigation")
+    
     while True:
         recover_dead_workers()
+        if datetime.utcnow() - last_baseline_refresh > timedelta(minutes=1):
+            latency_baselines = compute_latency_baselines(db)
+            print("[ORCH] Updated latency baselines:", latency_baselines)
+            last_baseline_refresh = datetime.utcnow()
+
+        detect_and_mitigate_stragglers(db, latency_baselines)
         time.sleep(MONITOR_INTERVAL)
 
 
