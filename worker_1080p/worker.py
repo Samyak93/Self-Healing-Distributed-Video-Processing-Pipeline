@@ -21,6 +21,7 @@ def heartbeat_loop(worker_id: str):
             {
                 "$set": {
                     "worker_id": worker_id,
+                    "container_name": os.environ["WORKER_CONTAINER_NAME"],
                     "resolution": "1080p",
                     "last_heartbeat": datetime.utcnow(),
                     "status": "ALIVE",

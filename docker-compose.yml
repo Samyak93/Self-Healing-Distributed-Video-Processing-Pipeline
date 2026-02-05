@@ -25,58 +25,86 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - MONGO_URL=mongodb://mongodb:27017
     command: python orchestrator.py
-    
+
+  # -------- Base workers (start by default) --------
   worker_480p:
     build: ./worker_480p
-    depends_on:
-      - redis
-      - mongodb
+    profiles: ["base"]
+    depends_on: [redis, mongodb]
     volumes:
       - ./videos:/data/videos
     environment:
       - REDIS_URL=redis://redis:6379/0
       - MONGO_URL=mongodb://mongodb:27017
-    command: celery -A celery_app worker -Q transcode_480p --loglevel=info
-    restart: unless-stopped
-    
-  worker_480p_2:
-    build: ./worker_480p
-    depends_on:
-      - redis
-      - mongodb
-    volumes:
-      - ./videos:/data/videos
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-      - MONGO_URL=mongodb://mongodb:27017
+      - WORKER_CONTAINER_NAME=distributedvideoprocessingpipeline-worker_480p-1
     command: celery -A celery_app worker -Q transcode_480p --loglevel=info --concurrency=1
-    restart: unless-stopped
-    
+    restart: "no"
+
   worker_720p:
     build: ./worker_720p
-    depends_on:
-      - redis
-      - mongodb
+    profiles: ["base"]
+    depends_on: [redis, mongodb]
     volumes:
       - ./videos:/data/videos
     environment:
       - REDIS_URL=redis://redis:6379/0
       - MONGO_URL=mongodb://mongodb:27017
+      - WORKER_CONTAINER_NAME=distributedvideoprocessingpipeline-worker_720p-1
     command: celery -A celery_app worker -Q transcode_720p --loglevel=info --concurrency=1
-    restart: unless-stopped
+    restart: "no"
 
   worker_1080p:
     build: ./worker_1080p
-    depends_on:
-      - redis
-      - mongodb
+    profiles: ["base"]
+    depends_on: [redis, mongodb]
     volumes:
       - ./videos:/data/videos
     environment:
       - REDIS_URL=redis://redis:6379/0
       - MONGO_URL=mongodb://mongodb:27017
+      - WORKER_CONTAINER_NAME=distributedvideoprocessingpipeline-worker_1080p-1
     command: celery -A celery_app worker -Q transcode_1080p --loglevel=info --concurrency=1
-    restart: unless-stopped
+    restart: "no"
+
+  # -------- Scale-only workers (NOT started by default) --------
+  worker_480p_2:
+    build: ./worker_480p
+    profiles: ["scale"]
+    depends_on: [redis, mongodb]
+    volumes:
+      - ./videos:/data/videos
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongodb:27017
+      - WORKER_CONTAINER_NAME=distributedvideoprocessingpipeline-worker_480p_2-1
+    command: celery -A celery_app worker -Q transcode_480p --loglevel=info --concurrency=1
+    restart: "no"
+
+  worker_720p_2:
+    build: ./worker_720p
+    profiles: ["scale"]
+    depends_on: [redis, mongodb]
+    volumes:
+      - ./videos:/data/videos
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongodb:27017
+      - WORKER_CONTAINER_NAME=distributedvideoprocessingpipeline-worker_720p_2-1
+    command: celery -A celery_app worker -Q transcode_720p --loglevel=info --concurrency=1
+    restart: "no"
+
+  worker_1080p_2:
+    build: ./worker_1080p
+    profiles: ["scale"]
+    depends_on: [redis, mongodb]
+    volumes:
+      - ./videos:/data/videos
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URL=mongodb://mongodb:27017
+      - WORKER_CONTAINER_NAME=distributedvideoprocessingpipeline-worker_1080p_2-1
+    command: celery -A celery_app worker -Q transcode_1080p --loglevel=info --concurrency=1
+    restart: "no"
 
 volumes:
   mongo_data:

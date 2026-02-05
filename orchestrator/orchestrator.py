@@ -21,13 +21,43 @@ MONITOR_INTERVAL = 10  # seconds
 BASELINE_SAMPLE_SIZE = 100
 STRAGGLER_THRESHOLD = 0.75  # 75%
 
+# ---------- AUTO-SCALING PARAMETERS ----------
+MIN_WORKERS = 1
+MAX_WORKERS = 2          # keep low for localhost
+SCALE_UP_THRESHOLD = 3   # pending chunks per worker
+SCALE_DOWN_THRESHOLD = 1
+SCALE_COOLDOWN = 60      # seconds
+
 # Map resolution -> container name
-WORKER_CONTAINERS = {
-    "480p": "distributedvideoprocessingpipeline-worker_480p-1",
-    "720p": "distributedvideoprocessingpipeline-worker_720p-1",
-    "1080p": "distributedvideoprocessingpipeline-worker_1080p-1",
+WORKER_POOLS = {
+    "480p": [
+        "distributedvideoprocessingpipeline-worker_480p-1",
+        "distributedvideoprocessingpipeline-worker_480p_2-1",
+    ],
+    "720p": [
+        "distributedvideoprocessingpipeline-worker_720p-1",
+        "distributedvideoprocessingpipeline-worker_720p_2-1",
+    ],
+    "1080p": [
+        "distributedvideoprocessingpipeline-worker_1080p-1",
+        "distributedvideoprocessingpipeline-worker_1080p_2-1",
+    ],
 }
 
+# ---------- DESIRED WORKER STATE ----------
+# resolution -> set(container_names)
+DESIRED_WORKERS = {
+    "480p": set([WORKER_POOLS["480p"][0]]),
+    "720p": set([WORKER_POOLS["720p"][0]]),
+    "1080p": set([WORKER_POOLS["1080p"][0]]),
+}
+
+# resolution -> last scale action time
+LAST_SCALE_ACTION = {
+    "480p": datetime.min,
+    "720p": datetime.min,
+    "1080p": datetime.min,
+}
 
 def split_video(video_path: str, video_id: str):
     output_dir = f"{VIDEO_CHUNK_DIR}/{video_id}"
@@ -49,16 +79,6 @@ def split_video(video_path: str, video_id: str):
     subprocess.run(cmd, check=True)
 
 
-def restart_worker(resolution: str):
-    container = WORKER_CONTAINERS[resolution]
-    print(f"[ORCH] Restarting worker container: {container}")
-
-    subprocess.run(
-        ["docker", "start", container],
-        check=False,
-    )
-
-
 def recover_dead_workers():
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
@@ -75,6 +95,11 @@ def recover_dead_workers():
     for worker in dead_workers:
         worker_id = worker["worker_id"]
         resolution = worker["resolution"]
+
+        # Only recover workers that are supposed to be running
+        container = worker.get("container_name")
+        if not container or container not in DESIRED_WORKERS.get(resolution, set()):
+            continue
 
         print(f"[DEAD] Worker {worker_id} ({resolution})")
 
@@ -115,8 +140,8 @@ def recover_dead_workers():
                 ],
             )
 
-        # Restart worker container
-        restart_worker(resolution)
+        # Restart only if desired:
+        docker_start(container)
         
 # ---------- STRAGGLER MITIGATION ----------
 
@@ -194,15 +219,92 @@ def detect_and_mitigate_stragglers(db, baselines):
             print(f"[SPECULATE] Relaunched chunk {chunk['chunk_id']} ({chunk['resolution']})")
 
 
+def docker_is_running(container):
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{.State.Running}}", container],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return result.stdout.strip() == "true"
+
+
+def docker_start(container):
+    if not docker_is_running(container):
+        subprocess.run(["docker", "start", container], check=False)
+
+
+def docker_stop(container):
+    if docker_is_running(container):
+        subprocess.run(["docker", "stop", container], check=False)
+    
+def auto_scale(db):
+    workers_col = db["workers"]
+    chunks_col = db["chunks"]
+    now = datetime.utcnow()
+
+    for res in RESOLUTIONS:
+        if (now - LAST_SCALE_ACTION[res]).total_seconds() < SCALE_COOLDOWN:
+            continue
+
+        desired = DESIRED_WORKERS[res]
+        pool = WORKER_POOLS[res]
+
+        alive_workers = workers_col.count_documents({
+            "resolution": res,
+            "status": "ALIVE",
+        })
+
+        pending_chunks = chunks_col.count_documents({
+            "resolution": res,
+            "status": "PENDING",
+        })
+
+        if alive_workers == 0:
+            continue
+            
+        alive_workers = min(alive_workers, len(desired))
+
+        load = pending_chunks / alive_workers
+
+        # ---- SCALE UP ----
+        if load > SCALE_UP_THRESHOLD and len(desired) < MAX_WORKERS:
+            for container in pool:
+                if container not in desired:
+                    print(f"[SCALE-UP] {res}: starting {container}")
+                    desired.add(container)
+                    print("DESIRED: ", desired)
+                    docker_start(container)
+                    LAST_SCALE_ACTION[res] = now
+                    break
+
+        # ---- SCALE DOWN ----
+        elif load < SCALE_DOWN_THRESHOLD and len(desired) > MIN_WORKERS:
+            container = next( c for c in reversed(WORKER_POOLS[res]) if c in desired)
+            print(f"[SCALE-DOWN] {res}: stopping {container}")
+            desired.remove(container)
+            docker_stop(container)
+            workers_col.update_many(
+                {"worker_id": {"$regex": container}},
+                {"$set": {"status": "STOPPED"}}
+            )
+            LAST_SCALE_ACTION[res] = now
+
 def main():
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     chunks_col = db["chunks"]
 
+    # Identity (correct & safe)
     chunks_col.create_index(
         [("video_id", ASCENDING), ("chunk_id", ASCENDING), ("resolution", ASCENDING)],
         unique=True
     )
+
+    # Performance indexes
+    chunks_col.create_index([("status", ASCENDING)])
+    chunks_col.create_index([("resolution", ASCENDING), ("status", ASCENDING)])
+    chunks_col.create_index([("resolution", ASCENDING), ("start_time", ASCENDING)])
 
     if not os.path.exists(VIDEO_INPUT_DIR):
         raise RuntimeError(f"Missing input directory: {VIDEO_INPUT_DIR}")
@@ -269,6 +371,7 @@ def main():
             last_baseline_refresh = datetime.utcnow()
 
         detect_and_mitigate_stragglers(db, latency_baselines)
+        auto_scale(db)
         time.sleep(MONITOR_INTERVAL)
 
 
