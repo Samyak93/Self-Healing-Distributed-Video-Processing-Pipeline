@@ -8,6 +8,7 @@ from celery_app import celery_app
 
 VIDEO_INPUT_DIR = "/data/videos/input"
 VIDEO_CHUNK_DIR = "/data/videos/chunks"
+FINAL_OUTPUT_DIR = "/data/videos/final_outputs"
 
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongodb:27017")
 
@@ -290,6 +291,111 @@ def auto_scale(db):
             )
             LAST_SCALE_ACTION[res] = now
 
+
+#-----------------MERGING and CLEANUP-------------------------------
+def try_merge_video(db, video_id: str, resolution: str):
+    chunks_col = db["chunks"]
+    outputs_col = db["final_outputs"]
+
+    # idempotency guard
+    if outputs_col.find_one({"video_id": video_id, "resolution": resolution}):
+        return
+
+    total = chunks_col.count_documents({
+        "video_id": video_id,
+        "resolution": resolution,
+    })
+
+    completed = chunks_col.count_documents({
+        "video_id": video_id,
+        "resolution": resolution,
+        "status": "COMPLETED",
+    })
+
+    if total == 0 or completed != total:
+        return
+
+    print(f"[MERGE] {video_id} ({resolution})")
+
+    # ---------- paths ----------
+    final_dir = f"{FINAL_OUTPUT_DIR}/{resolution}"
+    os.makedirs(final_dir, exist_ok=True)
+
+    final_output = f"{final_dir}/{video_id}.mp4"
+    concat_path = f"{final_dir}/{video_id}_concat.txt"
+
+    chunks = list(
+        chunks_col.find(
+            {
+                "video_id": video_id,
+                "resolution": resolution,
+                "status": "COMPLETED",
+            }
+        ).sort("chunk_id", 1)
+    )
+
+    with open(concat_path, "w") as f:
+        for c in chunks:
+            f.write(f"file '{c['output_path']}'\n")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", concat_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-ac", "2",
+        "-ar", "48000",
+        "-movflags", "+faststart",
+        final_output,
+    ]
+
+    subprocess.run(cmd, check=True)
+
+    # ---------- record final output ----------
+    outputs_col.insert_one({
+        "video_id": video_id,
+        "resolution": resolution,
+        "merged": True,
+        "merged_at": datetime.utcnow(),
+        "output_path": final_output,
+    })
+
+    print(f"[MERGED] {final_output}")
+
+    # ---------- CLEANUP (safe) ----------
+    # delete transcoded chunks
+    for c in chunks:
+        try:
+            os.remove(c["output_path"])
+        except FileNotFoundError:
+            pass
+
+    # delete concat file
+    try:
+        os.remove(concat_path)
+    except FileNotFoundError:
+        pass
+        
+        
+def try_cleanup_original_chunks(db, video_id: str):
+    outputs_col = db["final_outputs"]
+
+    done = outputs_col.count_documents({
+        "video_id": video_id,
+        "merged": True,
+    })
+
+    if done != len(RESOLUTIONS):
+        return
+
+    chunk_dir = f"{VIDEO_CHUNK_DIR}/{video_id}"
+    if os.path.exists(chunk_dir):
+        print(f"[CLEANUP] Removing original chunks for {video_id}")
+        subprocess.run(["rm", "-rf", chunk_dir], check=False)
+        
 def main():
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
@@ -372,6 +478,16 @@ def main():
 
         detect_and_mitigate_stragglers(db, latency_baselines)
         auto_scale(db)
+        
+        # Checking if everything's done and merging + cleaning up
+        videos = db.chunks.distinct("video_id")
+
+        for vid in videos:
+            for res in RESOLUTIONS:
+                try_merge_video(db, vid, res)
+
+            # only after all resolutions done
+            try_cleanup_original_chunks(db, vid)
         time.sleep(MONITOR_INTERVAL)
 
 
