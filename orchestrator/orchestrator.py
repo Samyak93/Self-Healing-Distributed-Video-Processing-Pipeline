@@ -1,3 +1,24 @@
+"""
+Capstone Project: Self-Healing Distributed Video Processing Pipeline
+
+This module acts as the central orchestrator for the distributed video
+processing system. It is responsible for:
+
+- Splitting input videos into chunks
+- Scheduling chunk transcoding tasks via Celery
+- Monitoring worker heartbeats
+- Detecting and recovering dead workers
+- Mitigating stragglers using speculative execution
+- Auto-scaling workers based on system load
+- Merging completed chunks into final videos
+- Performing safe cleanup of intermediate artifacts
+
+The orchestrator maintains all system state in MongoDB and coordinates
+execution across multiple resolution-specific worker pools.
+
+AUTHOR: Samyak Shah CS@RIT
+"""
+
 import os
 import subprocess
 import time
@@ -6,30 +27,34 @@ from datetime import datetime, timedelta
 from pymongo import MongoClient, ASCENDING
 from celery_app import celery_app
 
+# ---------- DIRECTORY CONFIGURATION ----------
 VIDEO_INPUT_DIR = "/data/videos/input"
 VIDEO_CHUNK_DIR = "/data/videos/chunks"
 FINAL_OUTPUT_DIR = "/data/videos/final_outputs"
 
+# ---------- DATABASE CONFIGURATION ----------
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://mongodb:27017")
 
+# ---------- PIPELINE CONFIGURATION ----------
 RESOLUTIONS = ["480p", "720p", "1080p"]
 CHUNK_DURATION = 10  # seconds
 
+# ---------- HEARTBEAT / MONITORING ----------
 HEARTBEAT_TIMEOUT = 30  # seconds
 MONITOR_INTERVAL = 10  # seconds
 
-# Straggler parameters
+# ---------- STRAGGLER MITIGATION ----------
 BASELINE_SAMPLE_SIZE = 100
 STRAGGLER_THRESHOLD = 0.75  # 75%
 
 # ---------- AUTO-SCALING PARAMETERS ----------
 MIN_WORKERS = 1
-MAX_WORKERS = 2          # keep low for localhost
-SCALE_UP_THRESHOLD = 3   # pending chunks per worker
+MAX_WORKERS = 2
+SCALE_UP_THRESHOLD = 3
 SCALE_DOWN_THRESHOLD = 1
-SCALE_COOLDOWN = 60      # seconds
+SCALE_COOLDOWN = 60  # seconds
 
-# Map resolution -> container name
+# ---------- WORKER POOLS ----------
 WORKER_POOLS = {
     "480p": [
         "distributedvideoprocessingpipeline-worker_480p-1",
@@ -46,14 +71,12 @@ WORKER_POOLS = {
 }
 
 # ---------- DESIRED WORKER STATE ----------
-# resolution -> set(container_names)
 DESIRED_WORKERS = {
     "480p": set([WORKER_POOLS["480p"][0]]),
     "720p": set([WORKER_POOLS["720p"][0]]),
     "1080p": set([WORKER_POOLS["1080p"][0]]),
 }
 
-# resolution -> last scale action time
 LAST_SCALE_ACTION = {
     "480p": datetime.min,
     "720p": datetime.min,
@@ -61,6 +84,13 @@ LAST_SCALE_ACTION = {
 }
 
 def split_video(video_path: str, video_id: str):
+    """
+    Split a video into fixed-duration chunks using FFmpeg.
+
+    :param video_path: Absolute path to input video
+    :param video_id: Unique identifier for the video
+    :return: None
+    """
     output_dir = f"{VIDEO_CHUNK_DIR}/{video_id}"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -79,8 +109,13 @@ def split_video(video_path: str, video_id: str):
 
     subprocess.run(cmd, check=True)
 
-
 def recover_dead_workers():
+    """
+    Detect workers that have missed heartbeats and recover
+    any in-flight chunks assigned to them.
+
+    :return: None
+    """
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     workers_col = db["workers"]
@@ -99,6 +134,7 @@ def recover_dead_workers():
 
         # Only recover workers that are supposed to be running
         container = worker.get("container_name")
+
         if not container or container not in DESIRED_WORKERS.get(resolution, set()):
             continue
 
@@ -109,7 +145,6 @@ def recover_dead_workers():
             {"$set": {"status": "DEAD"}}
         )
 
-        # Recover in-flight chunks
         stuck_chunks = chunks_col.find({
             "worker_id": worker_id,
             "status": "RUNNING",
@@ -143,19 +178,25 @@ def recover_dead_workers():
 
         # Restart only if desired:
         docker_start(container)
-        
+
 # ---------- STRAGGLER MITIGATION ----------
 
 def compute_latency_baselines(db):
+    """
+    Compute average chunk execution latency per resolution.
+
+    :param db: MongoDB database handle
+    :return: Dictionary of resolution -> baseline latency
+    """
     baselines = {}
 
     for res in RESOLUTIONS:
         docs = list(
             db.chunks.find(
                 {
-                    "resolution": res,
-                    "status": "COMPLETED",
-                    "duration_ms": {"$ne": None},
+                "resolution": res,
+                "status": "COMPLETED",
+                "duration_ms": {"$ne": None},
                 }
             )
             .sort("end_time", -1)
@@ -164,11 +205,17 @@ def compute_latency_baselines(db):
 
         if docs:
             baselines[res] = sum(d["duration_ms"] for d in docs) / len(docs)
-    
+
     return baselines
 
-
 def detect_and_mitigate_stragglers(db, baselines):
+    """
+    Detect slow-running chunks and relaunch them speculatively.
+
+    :param db: MongoDB database handle
+    :param baselines: Latency baseline per resolution
+    :return: None
+    """
     now = datetime.utcnow()
 
     running_chunks = db.chunks.find({
@@ -221,6 +268,12 @@ def detect_and_mitigate_stragglers(db, baselines):
 
 
 def docker_is_running(container):
+    """
+    Check whether a Docker container is currently running.
+
+    :param container: Container name
+    :return: True if running, False otherwise
+    """
     result = subprocess.run(
         ["docker", "inspect", "-f", "{{.State.Running}}", container],
         stdout=subprocess.PIPE,
@@ -229,17 +282,27 @@ def docker_is_running(container):
     )
     return result.stdout.strip() == "true"
 
-
 def docker_start(container):
+    """
+    Start a Docker container if not already running.
+    """
     if not docker_is_running(container):
         subprocess.run(["docker", "start", container], check=False)
 
-
 def docker_stop(container):
+    """
+    Stop a Docker container if it is running.
+    """
     if docker_is_running(container):
         subprocess.run(["docker", "stop", container], check=False)
-    
+
 def auto_scale(db):
+    """
+    Scale worker containers up or down based on load.
+
+    :param db: MongoDB database handle
+    :return: None
+    """
     workers_col = db["workers"]
     chunks_col = db["chunks"]
     now = datetime.utcnow()
@@ -263,9 +326,8 @@ def auto_scale(db):
 
         if alive_workers == 0:
             continue
-            
-        alive_workers = min(alive_workers, len(desired))
 
+        alive_workers = min(alive_workers, len(desired))
         load = pending_chunks / alive_workers
 
         # ---- SCALE UP ----
@@ -291,9 +353,17 @@ def auto_scale(db):
             )
             LAST_SCALE_ACTION[res] = now
 
+# ---------- MERGING & CLEANUP ----------
 
-#-----------------MERGING and CLEANUP-------------------------------
 def try_merge_video(db, video_id: str, resolution: str):
+    """
+    Merge all completed chunks for a video and resolution.
+
+    :param db: MongoDB database handle
+    :param video_id: Video identifier
+    :param resolution: Target resolution
+    :return: None
+    """
     chunks_col = db["chunks"]
     outputs_col = db["final_outputs"]
 
@@ -381,6 +451,13 @@ def try_merge_video(db, video_id: str, resolution: str):
         
         
 def try_cleanup_original_chunks(db, video_id: str):
+    """
+    Cleaning up the original chunks
+
+    :param db: Database Handle
+    :param video_id: Current video_id to check
+    :return: None
+    """
     outputs_col = db["final_outputs"]
 
     done = outputs_col.count_documents({
@@ -397,11 +474,16 @@ def try_cleanup_original_chunks(db, video_id: str):
         subprocess.run(["rm", "-rf", chunk_dir], check=False)
         
 def main():
+    """
+    Main Method and Control-Plane
+
+    :return: None
+    """
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     chunks_col = db["chunks"]
 
-    # Identity (correct & safe)
+    # Identity
     chunks_col.create_index(
         [("video_id", ASCENDING), ("chunk_id", ASCENDING), ("resolution", ASCENDING)],
         unique=True

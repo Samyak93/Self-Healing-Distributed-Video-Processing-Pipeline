@@ -1,3 +1,20 @@
+"""
+Capstone Project: Self-Healing Distributed Video Processing Pipeline
+
+Worker module responsible for transcoding video chunks into 720p resolution.
+
+Each worker:
+- Registers itself via heartbeats in MongoDB
+- Atomically claims video chunks from the database
+- Transcodes assigned chunks using FFmpeg
+- Updates execution metadata (timing, status, output paths)
+- Supports failure recovery and speculative re-execution
+
+This worker processes only 720p video chunks.
+
+AUTHOR: Samyak Shah CS@RIT
+"""
+
 import os
 import subprocess
 import threading
@@ -11,6 +28,12 @@ OUTPUT_DIR = "/data/videos/outputs/720p"
 
 
 def heartbeat_loop(worker_id: str):
+    """
+    Periodically updates worker heartbeat metadata in MongoDB.
+
+    :param worker_id: Unique identifier of the worker
+    :return: None
+    """
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     workers = db["workers"]
@@ -30,17 +53,26 @@ def heartbeat_loop(worker_id: str):
             upsert=True,
         )
         time.sleep(5)
-        
+
 
 @celery_app.task(name="tasks.transcode_720p", bind=True)
 def transcode_720p(self, video_id, chunk_id, chunk_path):
+    """
+    Celery task to transcode a video chunk into 720p resolution.
+
+    :param self: Celery task instance
+    :param video_id: Video identifier
+    :param chunk_id: Chunk index
+    :param chunk_path: Path to input chunk
+    :return: None
+    """
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     chunks = db["chunks"]
 
     worker_id = self.request.hostname
-    
-    # start heartbeat once per worker
+
+    # Start heartbeat once per worker
     if not hasattr(self, "_heartbeat_started"):
         threading.Thread(
             target=heartbeat_loop,
@@ -48,7 +80,7 @@ def transcode_720p(self, video_id, chunk_id, chunk_path):
             daemon=True,
         ).start()
         self._heartbeat_started = True
-        
+
     start_ts = datetime.utcnow()
 
     doc = chunks.find_one_and_update(

@@ -1,3 +1,20 @@
+"""
+Capstone Project: Self-Healing Distributed Video Processing Pipeline
+
+Worker module responsible for transcoding video chunks into 480p resolution.
+
+Each worker:
+- Registers itself via heartbeats in MongoDB
+- Atomically claims video chunks from the database
+- Transcodes assigned chunks using FFmpeg
+- Updates execution metadata (timing, status, output paths)
+- Supports failure recovery and speculative re-execution
+
+This worker processes only 480p video chunks.
+
+AUTHOR: Samyak Shah CS@RIT
+"""
+
 import os
 import threading
 import time
@@ -11,7 +28,15 @@ MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 VIDEO_CHUNK_DIR = "/data/videos/chunks"
 OUTPUT_DIR = "/data/videos/outputs/480p"
 
+
 def heartbeat_loop(worker_id: str):
+    """
+    Periodically sends heartbeat signals to MongoDB to indicate
+    that this worker container is alive and healthy.
+
+    :param worker_id: Unique identifier for the worker instance
+    :return: None
+    """
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     workers = db["workers"]
@@ -32,15 +57,30 @@ def heartbeat_loop(worker_id: str):
         )
         time.sleep(5)
 
+
 @celery_app.task(name="tasks.transcode_480p", bind=True)
 def transcode_480p(self, video_id, chunk_id, chunk_path):
+    """
+    Celery task to transcode a single video chunk into 480p resolution.
+
+    Uses atomic MongoDB operations to ensure:
+    - Exactly-once execution semantics
+    - Safe retries
+    - Protection against duplicate execution
+
+    :param self: Celery task instance
+    :param video_id: Unique identifier of the video
+    :param chunk_id: Index of the video chunk
+    :param chunk_path: Filesystem path to the chunk file
+    :return: None
+    """
     client = MongoClient(MONGO_URL)
     db = client["video_pipeline"]
     chunks = db["chunks"]
 
     worker_id = self.request.hostname
-    
-    # start heartbeat once per worker
+
+    # Start heartbeat thread once per worker process
     if not hasattr(self, "_heartbeat_started"):
         threading.Thread(
             target=heartbeat_loop,
@@ -48,10 +88,10 @@ def transcode_480p(self, video_id, chunk_id, chunk_path):
             daemon=True,
         ).start()
         self._heartbeat_started = True
-        
+
     start_ts = datetime.utcnow()
 
-    # ---- ATOMIC CLAIM (idempotency) ----
+    # ---- ATOMIC CLAIM (IDEMPOTENCY GUARANTEE) ----
     doc = chunks.find_one_and_update(
         {
             "video_id": video_id,
@@ -76,7 +116,7 @@ def transcode_480p(self, video_id, chunk_id, chunk_path):
     )
 
     if doc is None:
-        # Another worker already claimed or completed it
+        # Chunk already claimed or completed
         print(f"[SKIP] Chunk {chunk_id} already claimed.")
         return
 
